@@ -146,31 +146,113 @@ namespace MG
         {
             AssetDatabase.Refresh();
 
-            // Create new material
-            UnityEngine.Material material = new UnityEngine.Material(UnityEngine.Shader.Find("Standard"));
-            material.name = TexureName;
+            string albedoPath = RelativePath + "/" + TexureName + "_alb.png";
+            string normalPath = RelativePath + "/" + TexureName + "_nml.png";
+            string maskPath = RelativePath + "/" + TexureName + "_mos.png";
+            string displacementPath = RelativePath + "/" + TexureName + "_plx.png";
+            string materialPath = RelativePath + "/" + TexureName + ".mat";
 
-            // Set the textures to the material
-            material.EnableKeyword("_NORMALMAP");
-            material.EnableKeyword("_METALLICGLOSSMAP");
+            // Color textures use sRGB. PBR data maps must be sampled in linear space.
+            ConfigureTextureImporter(albedoPath, TextureImporterType.Default, true);
+            ConfigureTextureImporter(normalPath, TextureImporterType.NormalMap, false);
+            ConfigureTextureImporter(maskPath, TextureImporterType.Default, false);
+            ConfigureTextureImporter(displacementPath, TextureImporterType.Default, false);
 
-            // Reimport the normal map as a normal map texture type to avoid annoying error
-            TextureImporter normalMapImporter = (TextureImporter)TextureImporter.GetAtPath(RelativePath + "/" + TexureName + "_nml.png");
-            normalMapImporter.textureType = TextureImporterType.NormalMap;
-            normalMapImporter.SaveAndReimport();
+            UnityEngine.Shader shader = UnityEngine.Shader.Find("Universal Render Pipeline/Lit");
+            if (shader == null)
+            {
+                throw new InvalidOperationException(
+                    "Could not find 'Universal Render Pipeline/Lit'. " +
+                    "Install and activate URP before importing an ambientCG material.");
+            }
 
-            // Set the textures to the material
-            material.SetTexture("_MainTex", AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(RelativePath + "/" + TexureName + "_alb.png"));
-            material.SetTexture("_BumpMap", AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(RelativePath + "/" + TexureName + "_nml.png"));
-            material.SetTexture("_MetallicGlossMap", AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(RelativePath + "/" + TexureName + "_mos.png"));
-            material.SetTexture("_ParallaxMap", AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(RelativePath + "/" + TexureName + "_plx.png"));
+            UnityEngine.Material material =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Material>(materialPath);
+            bool isNewMaterial = material == null;
 
-            // Save the material
-            AssetDatabase.CreateAsset(material, RelativePath + "/" + TexureName + ".mat");
+            if (isNewMaterial)
+            {
+                material = new UnityEngine.Material(shader);
+                material.name = TexureName;
+            }
+            else
+            {
+                material.shader = shader;
+            }
+
+            UnityEngine.Texture2D albedo =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(albedoPath);
+            UnityEngine.Texture2D normal =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(normalPath);
+            UnityEngine.Texture2D mask =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(maskPath);
+
+            // The generated MOS map uses R = metallic, G = ambient occlusion,
+            // B = unused, and A = smoothness. URP reads the same texture through
+            // both slots to access the metallic/smoothness and occlusion channels.
+            SetTextureIfSupported(material, "_BaseMap", albedo);
+            SetTextureIfSupported(material, "_BumpMap", normal);
+            SetTextureIfSupported(material, "_MetallicGlossMap", mask);
+            SetTextureIfSupported(material, "_OcclusionMap", mask);
+
+            SetFloatIfSupported(material, "_Metallic", 1f);
+            SetFloatIfSupported(material, "_Smoothness", 1f);
+            SetFloatIfSupported(material, "_BumpScale", 1f);
+            SetFloatIfSupported(material, "_OcclusionStrength", 1f);
+
+            if (normal != null)
+                material.EnableKeyword("_NORMALMAP");
+            if (mask != null)
+            {
+                material.EnableKeyword("_METALLICSPECGLOSSMAP");
+                material.EnableKeyword("_OCCLUSIONMAP");
+            }
+
+            if (isNewMaterial)
+                AssetDatabase.CreateAsset(material, materialPath);
+            else
+                EditorUtility.SetDirty(material);
+
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
 
-            if (m_userInput.logging) UnityEngine.Debug.Log("Material successfully created at " + RelativePath + "/" + TexureName + ".mat");
+            if (m_userInput.logging)
+                UnityEngine.Debug.Log("URP material successfully created at " + materialPath);
+        }
+
+        private static void ConfigureTextureImporter(
+            string assetPath,
+            TextureImporterType textureType,
+            bool sRgb)
+        {
+            TextureImporter importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            if (importer == null)
+                return;
+
+            bool changed = importer.textureType != textureType || importer.sRGBTexture != sRgb;
+            importer.textureType = textureType;
+            importer.sRGBTexture = sRgb;
+
+            if (changed)
+                importer.SaveAndReimport();
+        }
+
+        private static void SetTextureIfSupported(
+            UnityEngine.Material material,
+            string propertyName,
+            UnityEngine.Texture texture)
+        {
+            if (texture != null && material.HasProperty(propertyName))
+                material.SetTexture(propertyName, texture);
+        }
+
+        private static void SetFloatIfSupported(
+            UnityEngine.Material material,
+            string propertyName,
+            float value)
+        {
+            if (material.HasProperty(propertyName))
+                material.SetFloat(propertyName, value);
         }
         #region Imported Methods
         /// <summary>
