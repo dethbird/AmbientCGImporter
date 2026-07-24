@@ -8,8 +8,11 @@ using System.Drawing.Imaging;
 using System.IO.Compression;
 using System.Linq;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using UnityEditor;
-using System.ComponentModel;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
 
 namespace MG
 {
@@ -32,26 +35,48 @@ namespace MG
             public string textureUrl;
             public int resolutionIndex;
             public bool logging;
+            public bool applySkybox;
         }
         private UserInput m_userInput = new UserInput();
 
-        private const string m_baseUrl = "https://ambientcg.com/get?file="; // The base of any download url for files
-        private string[] m_resolutions = new string[] { "1K", "2K", "4K", "8K", "12K", "16K" };
-
-        public string TexureName
+        [Serializable]
+        private sealed class AmbientCGApiResponse
         {
-            get { return m_userInput.textureUrl.Split('=')[1]; }
+            public AmbientCGAssetInfo[] foundAssets;
         }
 
-        public string FolderPath
+        [Serializable]
+        private sealed class AmbientCGAssetInfo
         {
-            get { return UnityEngine.Application.dataPath + "/AmbientCGImporter/Imported/" + TexureName; }
+            public string assetId;
+            public string dataType;
+            public string displayName;
         }
 
-        public string RelativePath
+        private sealed class ImportJob
         {
-            get { return "Assets/AmbientCGImporter/Imported/" + TexureName; }
+            public string AssetId;
+            public string DataType;
+            public string Resolution;
+            public bool Logging;
+            public bool ApplySkybox;
+
+            public string AbsoluteFolderPath =>
+                Path.Combine(UnityEngine.Application.dataPath, "AmbientCGImporter", "Imported", AssetId);
+
+            public string RelativeFolderPath =>
+                "Assets/AmbientCGImporter/Imported/" + AssetId;
         }
+
+        private const string m_downloadBaseUrl = "https://ambientcg.com/get?file=";
+        private const string m_metadataBaseUrl = "https://ambientcg.com/api/v2/full_json?id=";
+        private static readonly Regex m_assetIdPattern =
+            new Regex("^[A-Za-z0-9_-]+$", RegexOptions.CultureInvariant);
+        private readonly string[] m_resolutions = { "1K", "2K", "4K", "8K", "12K", "16K" };
+
+        private bool m_isImporting;
+        private string m_statusMessage;
+        private MessageType m_statusType = MessageType.Info;
 
         [MenuItem("Tools/AmbientCG Importer")]
         public static void OpenWindow()
@@ -69,88 +94,289 @@ namespace MG
             m_userInput.resolutionIndex = EditorGUILayout.Popup("Resolution", m_userInput.resolutionIndex, m_resolutions);
             UnityEngine.GUILayout.Space(5);
             m_userInput.logging = EditorGUILayout.Toggle("Logging", m_userInput.logging);
+            m_userInput.applySkybox = EditorGUILayout.Toggle(
+                new UnityEngine.GUIContent(
+                    "Apply HDRI To Scene",
+                    "When importing an HDRI, assign the generated skybox to the active scene."),
+                m_userInput.applySkybox);
             UnityEngine.GUILayout.Space(20);
-            if (UnityEngine.GUILayout.Button("Import")) Import();
+
+            using (new EditorGUI.DisabledScope(m_isImporting))
+            {
+                if (UnityEngine.GUILayout.Button(m_isImporting ? "Importing..." : "Import"))
+                    Import();
+            }
+
+            if (!string.IsNullOrEmpty(m_statusMessage))
+            {
+                UnityEngine.GUILayout.Space(10);
+                EditorGUILayout.HelpBox(m_statusMessage, m_statusType);
+            }
         }
 
         /// <summary>
         /// Main method for logic of importing
         /// </summary>
-        private void Import()
+        private async void Import()
         {
-            // Create the import folder if not already created
-            if (!AssetDatabase.IsValidFolder("Assets/AmbientCGImporter/Imported"))
+            if (!TryParseAssetId(m_userInput.textureUrl, out string requestedAssetId, out string parseError))
             {
+                SetStatus(parseError, MessageType.Error);
+                return;
+            }
+
+            m_isImporting = true;
+            SetStatus("Looking up " + requestedAssetId + " on ambientCG...", MessageType.Info);
+
+            WebClient client = null;
+            string temporaryZipPath = null;
+            string networkOperation = "metadata lookup";
+            try
+            {
+                client = new WebClient();
+                client.Headers[HttpRequestHeader.UserAgent] = "AmbientCGImporter-Unity";
+
+                AmbientCGAssetInfo asset = await FetchAssetInfo(client, requestedAssetId);
+                if (asset == null)
+                    throw new InvalidOperationException(
+                        "ambientCG did not return an asset named '" + requestedAssetId + "'.");
+
+                if (string.Equals(asset.dataType, "HDRIElement", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new NotSupportedException(
+                        asset.assetId + " is an HDRI Element, not a 360-degree panorama. " +
+                        "HDRI Elements cannot be imported as Unity skyboxes.");
+                }
+
+                bool isHdri = string.Equals(asset.dataType, "HDRI", StringComparison.OrdinalIgnoreCase);
+                bool isMaterial = string.Equals(asset.dataType, "Material", StringComparison.OrdinalIgnoreCase);
+                if (!isHdri && !isMaterial)
+                {
+                    throw new NotSupportedException(
+                        "ambientCG asset type '" + asset.dataType + "' is not supported. " +
+                        "This importer currently supports Material and HDRI assets.");
+                }
+
+                ImportJob job = new ImportJob
+                {
+                    AssetId = asset.assetId,
+                    DataType = asset.dataType,
+                    Resolution = m_resolutions[m_userInput.resolutionIndex],
+                    Logging = m_userInput.logging,
+                    ApplySkybox = m_userInput.applySkybox
+                };
+
+                string downloadUrl = CreateDownloadLink(job);
+                temporaryZipPath = CreateTemporaryZipPath(job);
+                SetStatus(
+                    "Detected " + (isHdri ? "HDRI environment" : "PBR material") +
+                    ". Downloading " + job.Resolution + "...",
+                    MessageType.Info);
+
+                if (job.Logging)
+                    UnityEngine.Debug.Log("Downloading " + job.AssetId + " from " + downloadUrl);
+
+                networkOperation = "asset download";
+                await client.DownloadFileTaskAsync(new Uri(downloadUrl), temporaryZipPath);
+
+                SetStatus("Download complete. Importing " + job.AssetId + "...", MessageType.Info);
+                EnsureImportFolders(job);
+                using (ZipArchive archive = ZipFile.OpenRead(temporaryZipPath))
+                {
+                    if (isHdri)
+                        ImportHdriArchive(archive, job);
+                    else
+                        ImportMaterialArchive(archive, job);
+                }
+
+                string successMessage = isHdri
+                    ? "HDRI skybox imported to " + job.RelativeFolderPath
+                    : "URP material imported to " + job.RelativeFolderPath;
+                SetStatus(successMessage, MessageType.Info);
+
+                if (job.Logging)
+                    UnityEngine.Debug.Log(successMessage);
+            }
+            catch (WebException exception)
+            {
+                string message =
+                    "ambientCG " + networkOperation + " failed. " +
+                    (networkOperation == "asset download"
+                        ? "The selected resolution may not be available. "
+                        : string.Empty) +
+                    GetWebExceptionDetails(exception);
+                SetStatus(message, MessageType.Error);
+                UnityEngine.Debug.LogError(message);
+            }
+            catch (Exception exception)
+            {
+                SetStatus(exception.Message, MessageType.Error);
+                UnityEngine.Debug.LogException(exception);
+            }
+            finally
+            {
+                client?.Dispose();
+                if (!string.IsNullOrEmpty(temporaryZipPath) && File.Exists(temporaryZipPath))
+                    File.Delete(temporaryZipPath);
+
+                m_isImporting = false;
+                Repaint();
+            }
+        }
+
+        internal static bool TryParseAssetId(string input, out string assetId, out string error)
+        {
+            assetId = null;
+            error = null;
+            string trimmed = input?.Trim();
+            if (string.IsNullOrEmpty(trimmed))
+            {
+                error = "Paste an ambientCG asset URL or asset ID.";
+                return false;
+            }
+
+            if (m_assetIdPattern.IsMatch(trimmed))
+            {
+                assetId = trimmed;
+                return true;
+            }
+
+            if (!Uri.TryCreate(trimmed, UriKind.Absolute, out Uri uri) ||
+                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+                !(string.Equals(uri.Host, "ambientcg.com", StringComparison.OrdinalIgnoreCase) ||
+                  string.Equals(uri.Host, "www.ambientcg.com", StringComparison.OrdinalIgnoreCase)))
+            {
+                error = "Enter a valid ambientCG HTTPS URL or asset ID.";
+                return false;
+            }
+
+            string path = uri.AbsolutePath.Trim('/');
+            if (path.StartsWith("a/", StringComparison.OrdinalIgnoreCase))
+            {
+                string[] pathParts = path.Split('/');
+                if (pathParts.Length >= 2)
+                    assetId = Uri.UnescapeDataString(pathParts[1]);
+            }
+            else if (string.Equals(path, "view", StringComparison.OrdinalIgnoreCase))
+            {
+                assetId = GetQueryParameter(uri.Query, "id");
+            }
+
+            if (string.IsNullOrEmpty(assetId) || !m_assetIdPattern.IsMatch(assetId))
+            {
+                assetId = null;
+                error = "The URL does not contain a valid ambientCG asset ID.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static string GetQueryParameter(string query, string parameterName)
+        {
+            if (string.IsNullOrEmpty(query))
+                return null;
+
+            foreach (string item in query.TrimStart('?').Split('&'))
+            {
+                string[] parts = item.Split(new[] { '=' }, 2);
+                if (parts.Length == 2 &&
+                    string.Equals(
+                        Uri.UnescapeDataString(parts[0]),
+                        parameterName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return Uri.UnescapeDataString(parts[1].Replace("+", " "));
+                }
+            }
+
+            return null;
+        }
+
+        private static async Task<AmbientCGAssetInfo> FetchAssetInfo(
+            WebClient client,
+            string requestedAssetId)
+        {
+            string metadataUrl = m_metadataBaseUrl + Uri.EscapeDataString(requestedAssetId);
+            string json = await client.DownloadStringTaskAsync(new Uri(metadataUrl));
+            AmbientCGApiResponse response =
+                UnityEngine.JsonUtility.FromJson<AmbientCGApiResponse>(json);
+            if (response?.foundAssets == null)
+                return null;
+
+            return response.foundAssets.FirstOrDefault(
+                       asset => string.Equals(
+                           asset.assetId,
+                           requestedAssetId,
+                           StringComparison.OrdinalIgnoreCase))
+                   ?? response.foundAssets.FirstOrDefault();
+        }
+
+        private static string CreateDownloadLink(ImportJob job)
+        {
+            string suffix = string.Equals(job.DataType, "HDRI", StringComparison.OrdinalIgnoreCase)
+                ? ".zip"
+                : "-PNG.zip";
+            return m_downloadBaseUrl + Uri.EscapeDataString(
+                job.AssetId + "_" + job.Resolution + suffix);
+        }
+
+        private static string CreateTemporaryZipPath(ImportJob job)
+        {
+            string temporaryFolder = Path.Combine(Path.GetTempPath(), "AmbientCGImporter");
+            Directory.CreateDirectory(temporaryFolder);
+            return Path.Combine(
+                temporaryFolder,
+                job.AssetId + "_" + job.Resolution + "_" + Guid.NewGuid().ToString("N") + ".zip");
+        }
+
+        private static void EnsureImportFolders(ImportJob job)
+        {
+            const string importedRoot = "Assets/AmbientCGImporter/Imported";
+            if (!AssetDatabase.IsValidFolder(importedRoot))
                 AssetDatabase.CreateFolder("Assets/AmbientCGImporter", "Imported");
-            }
 
-            string url = CreateDownloadLink();
-            DownloadFile(url);
+            if (!AssetDatabase.IsValidFolder(job.RelativeFolderPath))
+                AssetDatabase.CreateFolder(importedRoot, job.AssetId);
         }
 
-        /// <summary>
-        /// Creates a direct download link to the file given the input
-        /// </summary>
-        /// <returns></returns>
-        private string CreateDownloadLink()
+        private void ImportMaterialArchive(ZipArchive archive, ImportJob job)
         {
-            string resolution = m_resolutions[m_userInput.resolutionIndex];
-            return m_baseUrl + TexureName + "_" + resolution + "-PNG.zip";
+            ExtractAmbientCG(archive, job.AbsoluteFolderPath, job.AssetId);
+            CreateMaterial(job);
         }
 
-        /// <summary>
-        /// Starts downloading the file with the given url
-        /// </summary>
-        private void DownloadFile(string url)
+        private static void ImportHdriArchive(ZipArchive archive, ImportJob job)
         {
-            using (WebClient client = new WebClient())
+            string expectedSuffix = "_" + job.Resolution + "_HDR.exr";
+            ZipArchiveEntry hdriEntry = archive.Entries.FirstOrDefault(
+                entry => entry.Name.EndsWith(expectedSuffix, StringComparison.OrdinalIgnoreCase));
+            if (hdriEntry == null)
             {
-                Uri uri = new Uri(url);
-                client.DownloadFileTaskAsync(uri, FolderPath + ".zip");
-                client.DownloadFileCompleted += new AsyncCompletedEventHandler(OnDownloadComplete);
-                if (m_userInput.logging) UnityEngine.Debug.Log("Downloading texure " + TexureName + " from " + url);
-            }
-        }
-
-        /// <summary>
-        /// Called when the file has finished downloading
-        /// </summary>
-        private void OnDownloadComplete(object sender, AsyncCompletedEventArgs e)
-        {
-            if (m_userInput.logging) UnityEngine.Debug.Log("Download complete. Extracting textures");
-
-            // Create new folder to store the files about to be created
-            if (!AssetDatabase.IsValidFolder(FolderPath))
-            {
-                AssetDatabase.CreateFolder("Assets/AmbientCGImporter/Imported", TexureName);
+                throw new InvalidDataException(
+                    "The downloaded archive does not contain an HDR panorama ending in '" +
+                    expectedSuffix + "'.");
             }
 
-            // Extract textures from file downloaded
-            ExtractAmbientCG
-            (
-                new ZipArchive(File.OpenRead(FolderPath + ".zip"), ZipArchiveMode.Read),
-                FolderPath,
-                TexureName
-            );
+            string fileName = job.AssetId + "_" + job.Resolution + "_HDR.exr";
+            string absoluteTexturePath = Path.Combine(job.AbsoluteFolderPath, fileName);
+            ExtractEntry(hdriEntry, absoluteTexturePath);
 
-            // Delete the zip file
-            File.Delete(FolderPath + ".zip");
-
-            CreateMaterial();
+            AssetDatabase.Refresh();
+            string relativeTexturePath = job.RelativeFolderPath + "/" + fileName;
+            ConfigureHdriTextureImporter(relativeTexturePath, job.Resolution);
+            CreateSkyboxMaterial(job, relativeTexturePath);
         }
 
-        /// <summary>
-        /// Creates a new material from the textures extracted and places it in the folder created
-        /// </summary>
-        private void CreateMaterial()
+        private void CreateMaterial(ImportJob job)
         {
             AssetDatabase.Refresh();
 
-            string albedoPath = RelativePath + "/" + TexureName + "_alb.png";
-            string normalPath = RelativePath + "/" + TexureName + "_nml.png";
-            string maskPath = RelativePath + "/" + TexureName + "_mos.png";
-            string displacementPath = RelativePath + "/" + TexureName + "_plx.png";
-            string materialPath = RelativePath + "/" + TexureName + ".mat";
+            string albedoPath = job.RelativeFolderPath + "/" + job.AssetId + "_alb.png";
+            string normalPath = job.RelativeFolderPath + "/" + job.AssetId + "_nml.png";
+            string maskPath = job.RelativeFolderPath + "/" + job.AssetId + "_mos.png";
+            string displacementPath = job.RelativeFolderPath + "/" + job.AssetId + "_plx.png";
+            string materialPath = job.RelativeFolderPath + "/" + job.AssetId + ".mat";
 
             // Color textures use sRGB. PBR data maps must be sampled in linear space.
             ConfigureTextureImporter(albedoPath, TextureImporterType.Default, true);
@@ -173,7 +399,7 @@ namespace MG
             if (isNewMaterial)
             {
                 material = new UnityEngine.Material(shader);
-                material.name = TexureName;
+                material.name = job.AssetId;
             }
             else
             {
@@ -216,8 +442,135 @@ namespace MG
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
 
-            if (m_userInput.logging)
+            if (job.Logging)
                 UnityEngine.Debug.Log("URP material successfully created at " + materialPath);
+        }
+
+        private static void ConfigureHdriTextureImporter(string assetPath, string resolution)
+        {
+            TextureImporter importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            if (importer == null)
+                throw new InvalidOperationException("Unity could not import the HDR texture at " + assetPath);
+
+            importer.textureType = TextureImporterType.Default;
+            importer.textureShape = TextureImporterShape.Texture2D;
+            importer.sRGBTexture = false;
+            importer.mipmapEnabled = true;
+            importer.wrapModeU = UnityEngine.TextureWrapMode.Repeat;
+            importer.wrapModeV = UnityEngine.TextureWrapMode.Clamp;
+            importer.wrapModeW = UnityEngine.TextureWrapMode.Clamp;
+            importer.npotScale = TextureImporterNPOTScale.None;
+            importer.maxTextureSize = GetMaximumTextureSize(resolution);
+            importer.SaveAndReimport();
+        }
+
+        private static int GetMaximumTextureSize(string resolution)
+        {
+            switch (resolution)
+            {
+                case "1K": return 1024;
+                case "2K": return 2048;
+                case "4K": return 4096;
+                case "8K": return 8192;
+                case "12K":
+                case "16K":
+                    return 16384;
+                default:
+                    return 2048;
+            }
+        }
+
+        private static void CreateSkyboxMaterial(ImportJob job, string texturePath)
+        {
+            const string shaderName = "Skybox/Panoramic";
+            UnityEngine.Shader shader = UnityEngine.Shader.Find(shaderName);
+            if (shader == null)
+                throw new InvalidOperationException("Could not find Unity shader '" + shaderName + "'.");
+
+            UnityEngine.Texture2D hdri =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Texture2D>(texturePath);
+            if (hdri == null)
+                throw new InvalidOperationException("Could not load the imported HDR texture at " + texturePath);
+
+            string materialPath =
+                job.RelativeFolderPath + "/" + job.AssetId + "_Skybox.mat";
+            UnityEngine.Material material =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Material>(materialPath);
+            bool isNewMaterial = material == null;
+
+            if (isNewMaterial)
+            {
+                material = new UnityEngine.Material(shader)
+                {
+                    name = job.AssetId + "_Skybox"
+                };
+            }
+            else
+            {
+                material.shader = shader;
+            }
+
+            SetTextureIfSupported(material, "_MainTex", hdri);
+            SetFloatIfSupported(material, "_Mapping", 1f);
+            SetFloatIfSupported(material, "_ImageType", 0f);
+
+            if (isNewMaterial)
+            {
+                if (material.HasProperty("_Tint"))
+                    material.SetColor("_Tint", UnityEngine.Color.white);
+                SetFloatIfSupported(material, "_Exposure", 1f);
+                SetFloatIfSupported(material, "_Rotation", 0f);
+                AssetDatabase.CreateAsset(material, materialPath);
+            }
+            else
+            {
+                EditorUtility.SetDirty(material);
+            }
+
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+
+            if (job.ApplySkybox)
+            {
+                UnityEngine.RenderSettings.skybox = material;
+                UnityEngine.DynamicGI.UpdateEnvironment();
+
+                Scene activeScene = SceneManager.GetActiveScene();
+                if (activeScene.IsValid())
+                    EditorSceneManager.MarkSceneDirty(activeScene);
+            }
+        }
+
+        private static void ExtractEntry(ZipArchiveEntry entry, string outputPath)
+        {
+            string parentDirectory = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(parentDirectory))
+                Directory.CreateDirectory(parentDirectory);
+
+            using (Stream input = entry.Open())
+            using (FileStream output = new FileStream(
+                       outputPath,
+                       FileMode.Create,
+                       FileAccess.Write,
+                       FileShare.None))
+            {
+                input.CopyTo(output);
+            }
+        }
+
+        private static string GetWebExceptionDetails(WebException exception)
+        {
+            if (exception.Response is HttpWebResponse response)
+                return "HTTP " + (int)response.StatusCode + " (" + response.StatusDescription + ").";
+
+            return exception.Message;
+        }
+
+        private void SetStatus(string message, MessageType type)
+        {
+            m_statusMessage = message;
+            m_statusType = type;
+            Repaint();
         }
 
         private static void ConfigureTextureImporter(
